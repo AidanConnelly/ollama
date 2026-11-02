@@ -13,7 +13,8 @@ Start building with open models. Access the latest releases locally or in the cl
 ### macOS
 
 ```shell
-curl -fsSL https://ollama.com/install.sh | sh
+./scripts/build_darwin.sh
+./scripts/install.sh
 ```
 
 or [download manually](https://ollama.com/download/Ollama.dmg)
@@ -29,7 +30,9 @@ or [download manually](https://ollama.com/download/OllamaSetup.exe)
 ### Linux
 
 ```shell
-curl -fsSL https://ollama.com/install.sh | sh
+cmake -B build .
+cmake --build build --parallel 8
+./scripts/install.sh
 ```
 
 [Manual install instructions](https://docs.ollama.com/linux#manual-install)
