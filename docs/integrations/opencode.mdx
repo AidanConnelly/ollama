@@ -143,3 +143,9 @@ ollama launch opencode --config
 Models defined only in `opencode.json` do not appear in the `ollama launch` model picker.
 
 See OpenCode's [config precedence](https://opencode.ai/docs/config/#precedence-order).
+
+## Experimental edit constraints
+
+For local testing, set `OLLAMA_OPENCODE_EDIT_CONSTRAINTS=1` before starting the Ollama server. On native llama.cpp chat models, Ollama reads the working directory and recent `read` tool calls from OpenCode's request, then constrains the `edit` tool schema so its arguments are generated in `path` (or `filePath`), `oldString`, `newString` order. The current implementation uses the most recent readable file and offers `oldString` choices made from unique, exact spans between word, whitespace, or punctuation boundaries within a line, plus complete spans of up to eight lines. Read the target file immediately before editing it.
+
+This prototype reads those files with the Ollama server's permissions. It does not activate for rendered chat backends, requests without OpenCode's environment and read history, or schemas larger than its fixed size limit. It does not allow arbitrary character-boundary matches; unset the variable to restore the normal tool schema.

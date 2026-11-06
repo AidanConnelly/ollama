@@ -40,6 +40,7 @@ import (
 	"github.com/ollama/ollama/fs/gguf"
 	internalcloud "github.com/ollama/ollama/internal/cloud"
 	"github.com/ollama/ollama/internal/proxy"
+	"github.com/ollama/ollama/internal/telemetry"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/manifest"
@@ -52,6 +53,8 @@ import (
 	"github.com/ollama/ollama/types/errtypes"
 	"github.com/ollama/ollama/types/model"
 	"github.com/ollama/ollama/version"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const signinURLStr = "https://ollama.com/connect?name=%s&key=%s"
@@ -2471,6 +2474,23 @@ func (s *Server) ModelRecommendationsExperimentalHandler(c *gin.Context) {
 
 func Serve(ln net.Listener) error {
 	slog.SetDefault(logutil.NewLogger(os.Stderr, envconfig.LogLevel()))
+	shutdownTelemetry, telemetryEnabled, err := telemetry.Init(context.Background())
+	if err != nil {
+		return err
+	}
+	if telemetryEnabled {
+		slog.Info("OpenTelemetry tracing enabled")
+	}
+	if shutdownTelemetry != nil {
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdownTelemetry(ctx); err != nil {
+				slog.Warn("failed to shut down OpenTelemetry tracing", "error", err)
+			}
+		}()
+	}
+
 	slog.Info("server config", "env", envconfig.Values())
 	cloudDisabled, _ := internalcloud.Status()
 	slog.Info(fmt.Sprintf("Ollama cloud disabled: %t", cloudDisabled))
@@ -3018,6 +3038,7 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 
 func (s *Server) ChatHandler(c *gin.Context) {
 	checkpointStart := time.Now()
+	chatSpan := trace.SpanFromContext(c.Request.Context())
 
 	var req api.ChatRequest
 	body := struct {
@@ -3031,6 +3052,16 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	streaming := req.Stream == nil || *req.Stream
+	chatSpan.SetAttributes(
+		attribute.String("gen_ai.operation.name", "chat"),
+		attribute.String("gen_ai.request.model", req.Model),
+		attribute.Int("ollama.request.message_count", len(req.Messages)),
+		attribute.Int("ollama.request.tool_count", len(req.Tools)),
+		attribute.Int("ollama.request.image_count", countChatImages(req.Messages)),
+		attribute.Bool("ollama.response.streaming", streaming),
+	)
+	chatSpan.AddEvent("ollama.chat.request_parsed")
 
 	if len(body.Think) > 0 {
 		if err := json.Unmarshal(body.Think, &req.Think); err != nil {
@@ -3069,7 +3100,12 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		req.Runner = runner
 	}
 
+	_, lookupSpan := startChatStage(c.Request.Context(), "model.lookup")
 	m, err := s.getExistingModelForRunner(modelRef.Name.String(), req.Runner)
+	if err != nil {
+		recordTraceError(lookupSpan, "model lookup", err)
+	}
+	lookupSpan.End()
 	if err != nil {
 		switch {
 		case errors.Is(err, os.ErrNotExist):
@@ -3227,7 +3263,12 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		}
 	}
 
-	r, m, opts, err := s.scheduleRunnerForModel(c.Request.Context(), m, caps, req.Options, req.KeepAlive, req.Shift)
+	scheduleCtx, scheduleSpan := startChatStage(c.Request.Context(), "model.schedule")
+	r, m, opts, err := s.scheduleRunnerForModel(scheduleCtx, m, caps, req.Options, req.KeepAlive, req.Shift)
+	if err != nil {
+		recordTraceError(scheduleSpan, "model scheduling", err)
+	}
+	scheduleSpan.End()
 	if errors.Is(err, errCapabilityCompletion) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support chat", req.Model)})
 		return
@@ -3237,6 +3278,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	}
 
 	checkpointLoaded := time.Now()
+	chatSpan.SetAttributes(attribute.Int64("ollama.model.load_duration_ms", checkpointLoaded.Sub(checkpointStart).Milliseconds()))
+	chatSpan.AddEvent("ollama.chat.model_ready")
 
 	if len(req.Messages) == 0 {
 		c.JSON(http.StatusOK, api.ChatResponse{
@@ -3267,6 +3310,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	}
 
 	if chatModeForModel(m) == chatExecutionModeNative {
+		if envconfig.OpenCodeEditConstraints() {
+			req.Tools = constrainOpenCodeEditTools(req.Tools, msgs)
+		}
 		s.handleNativeChat(c, req, m, r, opts, msgs, checkpointStart, checkpointLoaded)
 		return
 	}
@@ -3292,12 +3338,21 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		truncate = false
 	}
 	promptOpts := optionsForPrompt(opts, r)
-	prompt, media, err := chatPrompt(c.Request.Context(), m, r.Tokenize, promptOpts, msgs, processedTools, req.Think, truncate)
+	promptCtx, promptSpan := startChatStage(c.Request.Context(), "prompt.prepare")
+	prompt, media, err := chatPrompt(promptCtx, m, r.Tokenize, promptOpts, msgs, processedTools, req.Think, truncate)
 	if err != nil {
+		recordTraceError(promptSpan, "prompt preparation", err)
+		promptSpan.End()
 		slog.Error("chat prompt error", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	promptSpan.SetAttributes(
+		attribute.String("ollama.prompt", prompt),
+		attribute.Int("ollama.prompt.byte_length", len(prompt)),
+		attribute.Int("ollama.prompt.image_count", len(media)),
+	)
+	promptSpan.End()
 
 	// If debug mode is enabled, return the rendered template instead of calling the model
 	if req.DebugRenderOnly {
@@ -3330,14 +3385,19 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		toolParser = tools.NewParser(m.Template.Template, req.Tools)
 	}
 
+	chatSpan.AddEvent("ollama.chat.generation_started")
+	generationCtx, generationSpan := startChatStage(c.Request.Context(), "generate")
+	progress := generationProgress{lastEvent: time.Now()}
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		defer generationSpan.End()
 
-		ctx, cancel := context.WithCancel(c.Request.Context())
+		ctx, cancel := context.WithCancel(generationCtx)
 		defer cancel()
 
 		var parserErr error
+		var generatedText strings.Builder
 
 		err := r.Completion(ctx, llm.CompletionRequest{
 			Prompt:          prompt,
@@ -3353,6 +3413,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			LeadingBOS:      leadingBOSForModel(m),
 			ThinkingClose:   thinkingCloseForCompletion(builtinParser, thinkTagParser),
 		}, func(r llm.CompletionResponse) {
+			generatedText.WriteString(r.Content)
+			progress.record(generationSpan, r.Done, r.PromptEvalCount, r.PromptEvalCachedCount, r.EvalCount, r.PromptEvalDuration, r.EvalDuration, r.DoneReason.String())
 			res := api.ChatResponse{
 				Model:     req.Model,
 				CreatedAt: time.Now().UTC(),
@@ -3441,11 +3503,14 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 			ch <- res
 		})
+		generationSpan.SetAttributes(attribute.String("ollama.generated_text", generatedText.String()))
 		if parserErr != nil {
+			recordTraceError(generationSpan, "response parsing", parserErr)
 			ch <- gin.H{"error": parserErr.Error()}
 			return
 		}
 		if err != nil {
+			recordTraceError(generationSpan, "generation", err)
 			s.sched.expireRunnersForRuntimeOOM(m, err)
 			var serr api.StatusError
 			if errors.As(err, &serr) {
@@ -3467,7 +3532,8 @@ func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, 
 
 func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model, r llm.LlamaServer, opts *api.Options, msgs []api.Message, checkpointStart, checkpointLoaded time.Time) {
 	truncate := req.Truncate == nil || *req.Truncate
-	nativeReq, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
+	promptCtx, promptSpan := startChatStage(c.Request.Context(), "prompt.prepare")
+	nativeReq, err := prepareNativeChatRequest(promptCtx, m, r, opts, llm.ChatRequest{
 		Messages:    msgs,
 		Tools:       req.Tools,
 		Format:      req.Format,
@@ -3478,6 +3544,8 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		TopLogprobs: req.TopLogprobs,
 	}, truncate)
 	if err != nil {
+		recordTraceError(promptSpan, "prompt preparation", err)
+		promptSpan.End()
 		slog.Error("chat template prompt error", "error", err)
 		var serr api.StatusError
 		if errors.As(err, &serr) {
@@ -3487,10 +3555,35 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		}
 		return
 	}
+	promptMessages, err := traceChatMessages(nativeReq.Messages)
+	if err != nil {
+		recordTraceError(promptSpan, "prompt serialization", err)
+	} else {
+		promptSpan.SetAttributes(attribute.String("ollama.prompt.messages", promptMessages))
+	}
+	promptAttrs := []attribute.KeyValue{
+		attribute.Int("ollama.prompt.message_count", len(nativeReq.Messages)),
+		attribute.Int("ollama.prompt.image_count", countChatImages(nativeReq.Messages)),
+	}
+	if len(nativeReq.Tools) > 0 {
+		if toolsJSON, err := json.Marshal(nativeReq.Tools); err != nil {
+			recordTraceError(promptSpan, "tool serialization", err)
+		} else {
+			promptAttrs = append(promptAttrs, attribute.String("ollama.prompt.tools", string(toolsJSON)))
+		}
+	}
+	if len(nativeReq.Format) > 0 {
+		promptAttrs = append(promptAttrs, attribute.String("ollama.prompt.format", string(nativeReq.Format)))
+	}
+	promptSpan.SetAttributes(promptAttrs...)
+	promptSpan.End()
 
 	if req.DebugRenderOnly {
-		prompt, err := r.ApplyChatTemplate(c.Request.Context(), nativeReq)
+		renderCtx, renderSpan := startChatStage(c.Request.Context(), "prompt.render")
+		prompt, err := r.ApplyChatTemplate(renderCtx, nativeReq)
 		if err != nil {
+			recordTraceError(renderSpan, "prompt rendering", err)
+			renderSpan.End()
 			var serr api.StatusError
 			if errors.As(err, &serr) {
 				c.JSON(serr.StatusCode, gin.H{"error": serr.ErrorMessage})
@@ -3499,6 +3592,8 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 			}
 			return
 		}
+		renderSpan.SetAttributes(attribute.Int("ollama.prompt.byte_length", len(prompt)))
+		renderSpan.End()
 
 		c.JSON(http.StatusOK, api.ChatResponse{
 			Model:     req.Model,
@@ -3511,11 +3606,24 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		return
 	}
 
+	trace.SpanFromContext(c.Request.Context()).AddEvent("ollama.chat.generation_started")
+	generationCtx, generationSpan := startChatStage(c.Request.Context(), "generate")
+	progress := generationProgress{lastEvent: time.Now()}
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		defer generationSpan.End()
 
-		err := r.Chat(c.Request.Context(), nativeReq, func(r llm.ChatResponse) {
+		var generatedText strings.Builder
+		var generatedThinking strings.Builder
+		var generatedToolCalls []api.ToolCall
+		err := r.Chat(generationCtx, nativeReq, func(r llm.ChatResponse) {
+			generatedText.WriteString(r.Message.Content)
+			generatedThinking.WriteString(r.Message.Thinking)
+			if r.Done {
+				generatedToolCalls = r.Message.ToolCalls
+			}
+			progress.record(generationSpan, r.Done, r.PromptEvalCount, r.PromptEvalCachedCount, r.EvalCount, r.PromptEvalDuration, r.EvalDuration, r.DoneReason.String())
 			res := api.ChatResponse{
 				Model:     req.Model,
 				CreatedAt: time.Now().UTC(),
@@ -3543,7 +3651,20 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 
 			ch <- res
 		})
+		generationAttrs := []attribute.KeyValue{
+			attribute.String("ollama.generated_text", generatedText.String()),
+			attribute.String("ollama.generated_thinking", generatedThinking.String()),
+		}
+		if len(generatedToolCalls) > 0 {
+			if toolCallsJSON, marshalErr := json.Marshal(generatedToolCalls); marshalErr != nil {
+				recordTraceError(generationSpan, "tool call serialization", marshalErr)
+			} else {
+				generationAttrs = append(generationAttrs, attribute.String("ollama.generated_tool_calls", string(toolCallsJSON)))
+			}
+		}
+		generationSpan.SetAttributes(generationAttrs...)
 		if err != nil {
+			recordTraceError(generationSpan, "generation", err)
 			s.sched.expireRunnersForRuntimeOOM(m, err)
 			var serr api.StatusError
 			if errors.As(err, &serr) {

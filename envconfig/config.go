@@ -218,6 +218,8 @@ var (
 	GoTemplate = BoolWithDefault("OLLAMA_GO_TEMPLATE")
 	// DebugLogRequests logs inference requests to disk for replay/debugging.
 	DebugLogRequests = Bool("OLLAMA_DEBUG_LOG_REQUESTS")
+	// OpenCodeEditConstraints enables experimental, filesystem-backed constraints for OpenCode edit tool calls.
+	OpenCodeEditConstraints = Bool("OLLAMA_OPENCODE_EDIT_CONSTRAINTS")
 	// KvCacheType is the quantization type for the K/V cache.
 	KvCacheType = String("OLLAMA_KV_CACHE_TYPE")
 	// NoHistory disables readline history.

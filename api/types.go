@@ -476,11 +476,13 @@ func mapToTypeScriptType(jsonType string) string {
 }
 
 type ToolFunctionParameters struct {
-	Type       string             `json:"type"`
-	Defs       any                `json:"$defs,omitempty"`
-	Items      any                `json:"items,omitempty"`
-	Required   []string           `json:"required,omitempty"`
-	Properties *ToolPropertiesMap `json:"properties"`
+	Type                 string                   `json:"type"`
+	Defs                 any                      `json:"$defs,omitempty"`
+	Items                any                      `json:"items,omitempty"`
+	AnyOf                []ToolFunctionParameters `json:"anyOf,omitempty"`
+	Required             []string                 `json:"required,omitempty"`
+	AdditionalProperties *bool                    `json:"additionalProperties,omitempty"`
+	Properties           *ToolPropertiesMap       `json:"properties"`
 }
 
 func (t *ToolFunctionParameters) String() string {
