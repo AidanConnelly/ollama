@@ -1,0 +1,186 @@
+--- a/common/common.h
++++ b/common/common.h
+@@ -3,6 +3,8 @@
+ #pragma once
+ 
+ #include "llama-cpp.h"
++#include <memory>
++namespace ollama_edit { class mask; }
+ 
+ #include "ggml-opt.h"
+ #include "ggml.h"
+@@ -227,6 +229,7 @@
+ 
+ // sampling parameters
+ struct common_params_sampling {
++    std::shared_ptr<ollama_edit::mask> edit_mask; // private; never a template input
+     uint32_t seed = LLAMA_DEFAULT_SEED; // the seed used to initialize llama_sampler
+ 
+     int32_t n_prev             = 64;     // number of previous tokens to remember
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -1,4 +1,5 @@
+ #include "sampling.h"
++#include "matcher.h"
+ 
+ #include "common.h"
+ #include "fit.h"
+@@ -126,6 +127,7 @@
+     std::mt19937 rng;
+ 
+     void reset() {
++        if (params.edit_mask) params.edit_mask->reset();
+         prev.clear();
+ 
+         llama_sampler_reset(chain);
+@@ -162,6 +164,21 @@
+             }
+         }
+ 
++        if (params.edit_mask) {
++            if (sampled_probs || sampled_logits || llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
++                throw std::runtime_error("oldString mask cannot use backend sampling");
++            }
++            uint64_t masked = 0;
++            for (auto & candidate : cur) {
++                if (!std::isfinite(candidate.logit)) continue;
++                if (!params.edit_mask->allows(common_token_to_piece(vocab, candidate.id, true), candidate.id,
++                                               llama_vocab_is_eog(vocab, candidate.id))) {
++                    candidate.logit = -INFINITY;
++                    ++masked;
++                }
++            }
++            params.edit_mask->masked(masked);
++        }
+         cur_p = { cur.data(), cur.size(), -1, false };
+     }
+ 
+@@ -443,9 +460,9 @@
+         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+     };
+ 
++    if (params.edit_mask) result->params.edit_mask = params.edit_mask->clone();
+     return result;
+ }
+-
+ void common_sampler_free(struct common_sampler * gsmpl) {
+     if (!gsmpl) {
+         return;
+@@ -479,6 +496,7 @@
+     }
+ 
+     const auto tm = gsmpl->tm();
++    if (is_generated && gsmpl->params.edit_mask) gsmpl->params.edit_mask->accept_token(token);
+ 
+     // grammar_should_apply() checks the reasoning budget state, so calculate this before we accept
+     const auto accept_grammar = is_generated && grammar_should_apply(gsmpl);
+@@ -516,7 +534,7 @@
+ }
+ 
+ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+-    return new common_sampler {
++    auto * copy = new common_sampler {
+         /* .params  = */ gsmpl->params,
+         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
+         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
+@@ -526,8 +544,10 @@
+         /* .cur_p   = */ gsmpl->cur_p,
+         /* .rng     = */ gsmpl->rng,
+     };
+-}
+-
++    if (gsmpl->params.edit_mask) copy->params.edit_mask = gsmpl->params.edit_mask->clone();
++    copy->cur_p.data = copy->cur.empty() ? nullptr : copy->cur.data();
++    return copy;
++}
+ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
+     if (!src || !dst || src == dst) {
+         return;
+@@ -541,6 +561,7 @@
+     llama_sampler_copy(src->chain,   dst->chain);
+ 
+     dst->params     = src->params;
++    if (src->params.edit_mask) dst->params.edit_mask = src->params.edit_mask->clone();
+     dst->prev       = src->prev;
+     dst->cur        = src->cur;
+     dst->cur_p      = src->cur_p;
+@@ -670,6 +691,7 @@
+ 
+     // resampling:
+     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
++    if (gsmpl->params.edit_mask) gsmpl->params.edit_mask->grammar_retry();
+     gsmpl->set_logits(ctx, idx);
+ 
+     llama_sampler_apply(rbudget,  &cur_p);
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -18,6 +18,7 @@
+ #include "llama.h"
+ #include "log.h"
+ #include "sampling.h"
++#include "native.h"
+ #include "speculative.h"
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
+@@ -2053,6 +2054,11 @@
+         }
+ 
+         // initialize samplers
++        if (task.params.sampling.edit_mask && spec) {
++            send_error(task, "oldString mask requires speculative decoding disabled (--spec-type none)", ERROR_TYPE_INVALID_REQUEST);
++            return false;
++        }
++        if (task.params.sampling.edit_mask) task.params.sampling.backend_sampling = false;
+         if (task.need_sampling()) {
+             try {
+                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+@@ -5362,6 +5368,10 @@
+                     data);
+ 
+             task.apply_chat_session(chat_session);
++            if (data.contains("_ollama_oldstring_mask")) {
++                task.params.sampling.edit_mask = ollama_edit::make_native_mask(data.at("_ollama_oldstring_mask"), chat_session, ctx_server.vocab);
++                task.params.sampling.backend_sampling = false;
++            }
+ 
+             task.id_slot = json_value(data, "id_slot", -1);
+             sse_ping_interval = task.params.sse_ping_interval;
+@@ -5722,7 +5732,7 @@
+         bool ctx_server; // do NOT delete this line
+         GGML_UNUSED(ctx_server);
+ 
+-        res->ok({{"status", "ok"}});
++        res->ok({{"status", "ok"}, {"ollama_oldstring_mask", 1}});
+         return res;
+     };
+ 
+@@ -5993,6 +6003,11 @@
+         auto res = create_response();
+         std::vector<raw_buffer> files;
+         json body = json::parse(req.body);
++        json edit_mask;
++        if (body.contains("_ollama_oldstring_mask")) {
++            edit_mask = body.at("_ollama_oldstring_mask");
++            body.erase("_ollama_oldstring_mask");
++        }
+         common_chat_session session;
+         json body_parsed = oaicompat_chat_params_parse(
+             ctx_server.vocab,
+@@ -6000,6 +6015,7 @@
+             meta->chat_params,
+             files,
+             session);
++        if (!edit_mask.is_null()) body_parsed["_ollama_oldstring_mask"] = std::move(edit_mask);
+         return handle_completions_impl(
+             req,
+             SERVER_TASK_TYPE_COMPLETION,
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -408,6 +408,7 @@
+                         const common_chat_templates_inputs & inputs,
+                         const common_chat_session_params &   params = {});
+ 
++    const common_chat_parser_params & edit_mask_parser_params() const { return parser_params; }
+     const common_chat_prompt & prompt() const { return prompt_parts; }
+     common_chat_format       format()   const { return parser_params.format; }
+     const common_chat_msg &  msg()      const { return result; }

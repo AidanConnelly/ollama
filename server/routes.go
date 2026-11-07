@@ -3309,10 +3309,15 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		w.SetThinking(req.Think)
 	}
 
-	if chatModeForModel(m) == chatExecutionModeNative {
-		if envconfig.OpenCodeEditConstraints() {
-			req.Tools = constrainOpenCodeEditTools(req.Tools, msgs)
+	if envconfig.OpenCodeEditConstraints() && chatModeForModel(m) != chatExecutionModeNative && openCodeWorkingDirectory(msgs) != "" {
+		for _, tool := range req.Tools {
+			if isOpenCodeEditTool(tool) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "OLLAMA_OPENCODE_EDIT_CONSTRAINTS requires native llama.cpp chat and a patched oldString-mask-v1 payload"})
+				return
+			}
 		}
+	}
+	if chatModeForModel(m) == chatExecutionModeNative {
 		s.handleNativeChat(c, req, m, r, opts, msgs, checkpointStart, checkpointLoaded)
 		return
 	}
@@ -3531,9 +3536,18 @@ func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, 
 }
 
 func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model, r llm.LlamaServer, opts *api.Options, msgs []api.Message, checkpointStart, checkpointLoaded time.Time) {
+	mask, err := prepareOpenCodeEditMask(c.Request.Context(), req.Tools, msgs)
+	if err == nil && mask != nil && !llm.IsLlamaCPP(r) {
+		err = fmt.Errorf("OLLAMA_OPENCODE_EDIT_CONSTRAINTS requires a native llama.cpp runner with oldString-mask-v1 support")
+	}
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	truncate := req.Truncate == nil || *req.Truncate
 	promptCtx, promptSpan := startChatStage(c.Request.Context(), "prompt.prepare")
 	nativeReq, err := prepareNativeChatRequest(promptCtx, m, r, opts, llm.ChatRequest{
+		EditMask:    mask,
 		Messages:    msgs,
 		Tools:       req.Tools,
 		Format:      req.Format,

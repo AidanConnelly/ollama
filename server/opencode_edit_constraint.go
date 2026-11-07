@@ -1,137 +1,119 @@
 package server
 
 import (
-	"encoding/json"
-	"index/suffixarray"
-	"io/fs"
+	"bytes"
+	"context"
+	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/envconfig"
+	"github.com/ollama/ollama/llm"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
-const (
-	openCodeEditToolName       = "edit"
-	openCodeReadToolName       = "read"
-	openCodeEditMaxFiles       = 4
-	openCodeEditMaxCandidates  = 2048
-	openCodeEditMaxFileBytes   = 256 * 1024
-	openCodeEditMaxSchemaBytes = 256 * 1024
-)
+const openCodeEditToolName = "edit"
 
-type openCodeRead struct {
-	path   string
-	offset int
-	limit  int
-}
-
-// constrainOpenCodeEditTools augments the OpenCode edit schema with the most
-// recent readable file from OpenCode read calls. The flat schema's ordered
-// required fields make llama.cpp's native tool grammar emit path, oldString,
-// then newString. oldString choices are exact, unique spans between lexical
-// boundaries within a line, plus complete spans of up to eight lines. This is
-// intentionally a bounded prototype rather than a general substring automaton.
-func constrainOpenCodeEditTools(tools api.Tools, messages []api.Message) api.Tools {
-	root := openCodeWorkingDirectory(messages)
-	if root == "" || !filepath.IsAbs(root) {
-		return tools
+// No messages or schemas are modified. Files are read and indexed lazily by the
+// native sampler; the manifest is rebuilt for every request, including follow-ups.
+func prepareOpenCodeEditMask(ctx context.Context, tools api.Tools, messages []api.Message) (*llm.EditMaskConfig, error) {
+	if !envconfig.OpenCodeEditConstraints() {
+		return nil, nil
 	}
-
-	reads := recentOpenCodeReads(messages)
-	if len(reads) == 0 {
-		return tools
-	}
-
-	editIndex := -1
-	editPathField := ""
-	for i := range tools {
-		if field, ok := openCodeEditPathField(tools[i]); ok {
-			editIndex = i
-			editPathField = field
+	field := ""
+	for _, tool := range tools {
+		if f, ok := openCodeEditPathField(tool); ok {
+			field = f
 			break
 		}
 	}
-	if editIndex < 0 {
-		return tools
+	if field == "" {
+		return nil, nil
 	}
-
+	root := openCodeWorkingDirectory(messages)
+	if root == "" || !filepath.IsAbs(root) {
+		slog.Info("oldString mask skipped", "reason", "missing_working_directory")
+		trace.SpanFromContext(ctx).AddEvent("ollama.edit_mask.skipped", trace.WithAttributes(attribute.String("reason", "missing_working_directory")))
+		return nil, nil
+	}
 	root, err := filepath.EvalSymlinks(root)
 	if err != nil {
-		return tools
+		return nil, fmt.Errorf("oldString mask working directory: %w", err)
 	}
-	root, err = filepath.Abs(root)
+	paths, err := openCodeEligibleManifest(ctx, root)
 	if err != nil {
-		return tools
+		return nil, err
 	}
+	slog.Info("oldString mask configured", "files", len(paths), "implementation", "oldString-mask-v1")
+	trace.SpanFromContext(ctx).AddEvent("ollama.edit_mask.configured", trace.WithAttributes(attribute.Int("files", len(paths))))
+	return &llm.EditMaskConfig{RequestID: uuid.NewString(), Version: 1, Root: root, Files: paths, PathField: field}, nil
+}
 
-	editTool := tools[editIndex]
-	var parameters *api.ToolFunctionParameters
-	for _, read := range reads {
-		rel, text, err := readOpenCodeFile(root, read.path)
+// An empty private Git index applies Git's own ignore semantics even when root
+// is not a repository. It also treats tracked-but-ignored files consistently.
+// Neither the user's index nor their repository configuration is read/written.
+func openCodeEligibleManifest(ctx context.Context, root string) ([]string, error) {
+	gitDir, err := os.MkdirTemp("", "ollama-edit-manifest-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(gitDir)
+	run := func(args ...string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, "git", args...)
+		// Discard inherited Git overrides, global excludes and repository config.
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, "GIT_") {
+				cmd.Env = append(cmd.Env, entry)
+			}
+		}
+		cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_COUNT=0")
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("oldString mask manifest requires Git: %w", err)
+		}
+		return out, nil
+	}
+	if _, err := run("init", "--bare", "--quiet", gitDir); err != nil {
+		return nil, err
+	}
+	out, err := run("--git-dir="+gitDir, "--work-tree="+root, "-c", "core.bare=false", "-c", "core.excludesFile="+os.DevNull,
+		"ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return nil, err
+	}
+	paths := []string{}
+	for _, raw := range bytes.Split(out, []byte{0}) {
+		if len(raw) == 0 {
+			continue
+		}
+		rel := string(raw)
+		if strings.Contains("/"+filepath.ToSlash(rel)+"/", "/.git/") {
+			continue
+		}
+		full := filepath.Join(root, rel)
+		resolved, err := filepath.EvalSymlinks(full)
 		if err != nil {
 			continue
 		}
-		candidates := uniqueEditSnippets(text, read.offset, read.limit)
-		if len(candidates) == 0 {
+		inside, err := filepath.Rel(root, resolved)
+		if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
 			continue
 		}
-
-		properties := api.NewToolPropertiesMap()
-		pathProperty, _ := editTool.Function.Parameters.Properties.Get(editPathField)
-		pathProperty.Type = api.PropertyType{"string"}
-		pathValue := rel
-		if editPathField == "filePath" {
-			pathValue = filepath.Join(root, filepath.FromSlash(rel))
+		info, err := os.Stat(full)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
 		}
-		pathProperty.Enum = []any{pathValue}
-		properties.Set(editPathField, pathProperty)
-
-		oldStringProperty, _ := editTool.Function.Parameters.Properties.Get("oldString")
-		oldStringProperty.Type = api.PropertyType{"string"}
-		oldStringProperty.Enum = make([]any, len(candidates))
-		for i, candidate := range candidates {
-			oldStringProperty.Enum[i] = candidate
-		}
-		properties.Set("oldString", oldStringProperty)
-
-		newStringProperty, _ := editTool.Function.Parameters.Properties.Get("newString")
-		newStringProperty.Type = api.PropertyType{"string"}
-		newStringProperty.Enum = nil
-		properties.Set("newString", newStringProperty)
-
-		required := []string{editPathField, "oldString", "newString"}
-		if replaceAll, ok := editTool.Function.Parameters.Properties.Get("replaceAll"); ok {
-			replaceAll.Type = api.PropertyType{"boolean"}
-			properties.Set("replaceAll", replaceAll)
-		}
-
-		noAdditionalProperties := false
-		constrained := api.ToolFunctionParameters{
-			Type:                 "object",
-			Required:             required,
-			AdditionalProperties: &noAdditionalProperties,
-			Properties:           properties,
-		}
-		parameters = &constrained
-		break
+		paths = append(paths, filepath.ToSlash(rel))
 	}
-	if parameters == nil {
-		return tools
-	}
-
-	constrained := append(api.Tools(nil), tools...)
-	function := constrained[editIndex].Function
-	function.Parameters = *parameters
-	constrained[editIndex].Function = function
-
-	encoded, err := json.Marshal(constrained)
-	if err != nil || len(encoded) > openCodeEditMaxSchemaBytes {
-		return tools
-	}
-	return constrained
+	sort.Strings(paths)
+	return paths, nil
 }
 
 func isOpenCodeEditTool(tool api.Tool) bool {
@@ -188,172 +170,4 @@ func openCodeWorkingDirectory(messages []api.Message) string {
 		}
 	}
 	return directory
-}
-
-func recentOpenCodeReads(messages []api.Message) []openCodeRead {
-	var reads []openCodeRead
-	seen := make(map[string]struct{})
-	for i := len(messages) - 1; i >= 0 && len(reads) < openCodeEditMaxFiles; i-- {
-		for j := len(messages[i].ToolCalls) - 1; j >= 0 && len(reads) < openCodeEditMaxFiles; j-- {
-			call := messages[i].ToolCalls[j]
-			if call.Function.Name != openCodeReadToolName {
-				continue
-			}
-			var path string
-			for _, name := range []string{"filePath", "path"} {
-				if value, ok := call.Function.Arguments.Get(name); ok {
-					path, _ = value.(string)
-				}
-				if path != "" {
-					break
-				}
-			}
-			if path == "" {
-				continue
-			}
-			if _, ok := seen[path]; ok {
-				continue
-			}
-			seen[path] = struct{}{}
-
-			read := openCodeRead{path: path, offset: 1, limit: 2000}
-			if value, ok := call.Function.Arguments.Get("offset"); ok {
-				if n := numericInt(value); n > 0 {
-					read.offset = n
-				}
-			}
-			if value, ok := call.Function.Arguments.Get("limit"); ok {
-				if n := numericInt(value); n > 0 {
-					read.limit = min(n, 2000)
-				}
-			}
-			reads = append(reads, read)
-		}
-	}
-	return reads
-}
-
-func numericInt(value any) int {
-	switch value := value.(type) {
-	case int:
-		return value
-	case int64:
-		return int(value)
-	case float64:
-		return int(value)
-	case json.Number:
-		n, _ := value.Int64()
-		return int(n)
-	default:
-		return 0
-	}
-}
-
-func readOpenCodeFile(root, requested string) (string, string, error) {
-	path := requested
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(root, filepath.FromSlash(path))
-	}
-	path, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", "", err
-	}
-	path, err = filepath.Abs(path)
-	if err != nil {
-		return "", "", err
-	}
-	rel, err := filepath.Rel(root, path)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", "", fs.ErrPermission
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", "", err
-	}
-	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > openCodeEditMaxFileBytes {
-		return "", "", fs.ErrInvalid
-	}
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return "", "", err
-	}
-	if !utf8.Valid(content) || strings.IndexByte(string(content), 0) >= 0 {
-		return "", "", fs.ErrInvalid
-	}
-	return filepath.ToSlash(rel), string(content), nil
-}
-
-func uniqueEditSnippets(content string, offset, limit int) []string {
-	lines := strings.SplitAfter(content, "\n")
-	start := max(offset-1, 0)
-	if start >= len(lines) {
-		return nil
-	}
-	end := min(start+limit, len(lines))
-	lines = lines[start:end]
-	if len(lines) == 0 {
-		return nil
-	}
-
-	var snippets []string
-	seen := make(map[string]struct{})
-	index := suffixarray.New([]byte(content))
-	add := func(snippet string) bool {
-		if snippet == "" || len(snippet) > 4096 || strings.TrimSpace(snippet) == "" {
-			return false
-		}
-		if _, ok := seen[snippet]; ok {
-			return false
-		}
-		if len(index.Lookup([]byte(snippet), 2)) != 1 {
-			return false
-		}
-		seen[snippet] = struct{}{}
-		snippets = append(snippets, snippet)
-		return len(snippets) >= openCodeEditMaxCandidates
-	}
-
-	for _, line := range lines {
-		boundaries := lexicalBoundaries(line)
-		for i := 0; i+1 < len(boundaries); i++ {
-			for j := i + 1; j < len(boundaries); j++ {
-				if add(line[boundaries[i]:boundaries[j]]) {
-					return snippets
-				}
-			}
-		}
-	}
-
-	for width := 2; width <= 8; width++ {
-		for i := 0; i+width <= len(lines); i++ {
-			snippet := strings.Join(lines[i:i+width], "")
-			if add(snippet) {
-				return snippets
-			}
-		}
-	}
-	return snippets
-}
-
-func lexicalBoundaries(line string) []int {
-	boundaries := []int{0}
-	previousClass := byte(0)
-	for offset, r := range line {
-		currentClass := byte(3)
-		switch {
-		case r == '_' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || unicode.IsLetter(r):
-			currentClass = 1
-		case unicode.IsSpace(r):
-			currentClass = 2
-		}
-		if offset > 0 && currentClass != previousClass {
-			boundaries = append(boundaries, offset)
-		}
-		previousClass = currentClass
-	}
-	if boundaries[len(boundaries)-1] != len(line) {
-		boundaries = append(boundaries, len(line))
-	}
-	return boundaries
 }

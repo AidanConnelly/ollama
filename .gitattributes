@@ -13,3 +13,6 @@ llama/build-info.cpp linguist-generated
 
 * text=auto
 *.go text eol=lf
+
+# Empty context lines in unified diffs contain a single space.
+llama/compat/*.patch whitespace=-blank-at-eol

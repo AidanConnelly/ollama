@@ -220,6 +220,8 @@ var (
 	DebugLogRequests = Bool("OLLAMA_DEBUG_LOG_REQUESTS")
 	// OpenCodeEditConstraints enables experimental, filesystem-backed constraints for OpenCode edit tool calls.
 	OpenCodeEditConstraints = Bool("OLLAMA_OPENCODE_EDIT_CONSTRAINTS")
+	// OpenCodeEditExperiment gives both paired experiment conditions the same CPU sampling path.
+	OpenCodeEditExperiment = Bool("OLLAMA_OPENCODE_EDIT_EXPERIMENT")
 	// KvCacheType is the quantization type for the K/V cache.
 	KvCacheType = String("OLLAMA_KV_CACHE_TYPE")
 	// NoHistory disables readline history.

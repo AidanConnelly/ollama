@@ -1,0 +1,7 @@
+In `src/lib.rs` of this sled checkout, add exactly one ordinary Rust line comment immediately before the existing crate-level documentation block describing sled as a high-performance embedded database. The comment text must be:
+
+`// The crate-level documentation begins below.`
+
+Before editing, use OpenCode's `read` tool to inspect `src/lib.rs` with `offset` set to 1 and `limit` set to 100. Use the `edit` tool to insert only the requested comment and leave every existing line unchanged. Then use `read` again with `offset` 1 and `limit` 100 to confirm the result.
+
+Do not run tests or modify any other file. Finish with a concise report and end with exactly one standalone line: `EXPERIMENT_RESULT: SUCCESS` if you completed the edit, otherwise `EXPERIMENT_RESULT: FAILURE`.

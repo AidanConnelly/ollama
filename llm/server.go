@@ -225,6 +225,8 @@ type CompletionRequest struct {
 }
 
 type ChatRequest struct {
+	// EditMask is private runner metadata. It must never enter template inputs.
+	EditMask *EditMaskConfig `json:"-"`
 	Messages []api.Message
 	Tools    api.Tools
 	Format   json.RawMessage

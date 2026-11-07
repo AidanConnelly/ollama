@@ -187,6 +187,28 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(llama_cpp)
 
+# common.h contains the private mask state; propagate its header directory to
+# the server and all targets that consume llama-common.
+foreach(_common_target IN ITEMS llama-common common)
+    if(TARGET ${_common_target})
+        target_include_directories(${_common_target} PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../edit-mask")
+    endif()
+endforeach()
+
+add_executable(ollama-edit-mask-test EXCLUDE_FROM_ALL ../edit-mask/matcher_test.cpp)
+target_compile_features(ollama-edit-mask-test PRIVATE cxx_std_17)
+add_executable(ollama-edit-mask-native-test EXCLUDE_FROM_ALL ../edit-mask/native_test.cpp)
+target_link_libraries(ollama-edit-mask-native-test PRIVATE llama-common)
+target_compile_features(ollama-edit-mask-native-test PRIVATE cxx_std_17)
+# Assertions are the test oracle, including Release builds.
+if(MSVC)
+    target_compile_options(ollama-edit-mask-test PRIVATE /UNDEBUG)
+    target_compile_options(ollama-edit-mask-native-test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(ollama-edit-mask-test PRIVATE -UNDEBUG)
+    target_compile_options(ollama-edit-mask-native-test PRIVATE -UNDEBUG)
+endif()
+
 if(NOT COMMAND license_add_file)
     message(FATAL_ERROR "llama.cpp license registry (cmake/license.cmake) not found; check the llama.cpp update")
 endif()

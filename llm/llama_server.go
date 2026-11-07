@@ -147,6 +147,7 @@ func llamaServerRepeatLastN(repeatLastN, numCtx int) int {
 // llamaServerRunner wraps an upstream llama-server process and implements the LlamaServer interface.
 // It communicates with llama-server over HTTP.
 type llamaServerRunner struct {
+	editMaskTelemetry  editMaskTelemetry
 	port               int
 	cmd                *exec.Cmd
 	done               chan struct{}
@@ -841,6 +842,9 @@ const (
 )
 
 func appendDraftArgs(params []string, draftType, draftModelPath string, opts api.Options) []string {
+	if envconfig.OpenCodeEditConstraints() || envconfig.OpenCodeEditExperiment() {
+		return append(params, "--spec-type", "none")
+	}
 	if draftType == "" && draftModelPath == "" {
 		return params
 	}
@@ -2064,6 +2068,15 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	if err != nil {
 		return err
 	}
+	if req.EditMask != nil {
+		if err := s.requireEditMaskCapability(ctx); err != nil {
+			return err
+		}
+		lsReq["_ollama_oldstring_mask"] = req.EditMask
+		lsReq["backend_sampling"] = false
+		unregister := s.registerEditMask(ctx, req.EditMask.RequestID)
+		defer unregister()
+	}
 
 	buffer := &bytes.Buffer{}
 	enc := json.NewEncoder(buffer)
@@ -2320,6 +2333,9 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
 		"presence_penalty":  req.Options.PresencePenalty,
 		"typical_p":         req.Options.TypicalP,
 		"seed":              req.Options.Seed,
+	}
+	if envconfig.OpenCodeEditExperiment() {
+		body["backend_sampling"] = false
 	}
 	if len(req.Tools) > 0 {
 		body["tools"] = req.Tools
@@ -2941,6 +2957,7 @@ func deviceName(backendName string) string {
 
 func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 	if w.runner != nil {
+		w.runner.editMaskTelemetry.consume(b)
 		if len(b) > 0 && w.runner.loadTracking.Load() {
 			w.runner.noteLoadActivity(time.Now())
 		}
